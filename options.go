@@ -148,6 +148,16 @@ type Options struct {
 	// 1MB is used. The value of EdgeTriggeredIOChunk must be a power of 2,
 	// otherwise, it will be rounded up to the nearest power of 2.
 	EdgeTriggeredIOChunk int
+
+	// SuspendReaderWhenBufferFull suspend reader when el read buffer is full, prevent OOM
+	SuspendReaderWhenBufferOverflow int
+}
+
+// WithSuspendReaderWhenBufferFull suspend reader when el read buffer is full, only works for unix/linux for now
+func WithSuspendReaderWhenBufferOverflow(suspend int) Option {
+	return func(opts *Options) {
+		opts.SuspendReaderWhenBufferOverflow = suspend
+	}
 }
 
 // WithOptions sets up all options.
