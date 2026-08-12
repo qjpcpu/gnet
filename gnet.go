@@ -480,6 +480,27 @@ type Conn interface {
 }
 
 type (
+	// ReadController is an optional connection capability for transport-level
+	// backpressure. Applications should use a type assertion on Conn before use.
+	// It is currently supported for stream connections on Linux; unsupported
+	// transports and platforms return ErrUnsupportedOp.
+	ReadController interface {
+		// PauseRead stops monitoring read events, allowing the transport's native
+		// flow control to apply backpressure to the remote peer.
+		PauseRead(callback AsyncCallback) error
+
+		// ResumeRead resumes monitoring read events after PauseRead.
+		ResumeRead(callback AsyncCallback) error
+	}
+
+	// WriteBufferEmptyEventHandler is an optional extension to EventHandler.
+	// OnWriteBufferEmpty fires when a stream connection's outbound buffer
+	// transitions from non-empty to empty. Data written directly without being
+	// buffered does not trigger this event.
+	WriteBufferEmptyEventHandler interface {
+		OnWriteBufferEmpty(c Conn) (action Action)
+	}
+
 	// EventHandler represents the engine events' callbacks for the Run call.
 	// Each event has an Action return value that is used manage the state
 	// of the connection and engine.

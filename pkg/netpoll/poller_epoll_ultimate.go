@@ -190,9 +190,9 @@ func (p *Poller) Polling() error {
 // AddReadWrite registers the given file descriptor with readable and writable events to the poller.
 func (p *Poller) AddReadWrite(pa *PollAttachment, edgeTriggered bool) error {
 	var ev epollevent
-	ev.events = ReadWriteEvents
+	ev.events = ReadWriteEvents | unix.EPOLLRDHUP
 	if edgeTriggered {
-		ev.events |= unix.EPOLLET | unix.EPOLLRDHUP
+		ev.events |= unix.EPOLLET
 	}
 	convertPollAttachment(unsafe.Pointer(&ev.data), pa)
 	return os.NewSyscallError("epoll_ctl add", epollCtl(p.fd, unix.EPOLL_CTL_ADD, pa.FD, &ev))
@@ -201,9 +201,9 @@ func (p *Poller) AddReadWrite(pa *PollAttachment, edgeTriggered bool) error {
 // AddRead registers the given file descriptor with readable event to the poller.
 func (p *Poller) AddRead(pa *PollAttachment, edgeTriggered bool) error {
 	var ev epollevent
-	ev.events = ReadEvents
+	ev.events = ReadEvents | unix.EPOLLRDHUP
 	if edgeTriggered {
-		ev.events |= unix.EPOLLET | unix.EPOLLRDHUP
+		ev.events |= unix.EPOLLET
 	}
 	convertPollAttachment(unsafe.Pointer(&ev.data), pa)
 	return os.NewSyscallError("epoll_ctl add", epollCtl(p.fd, unix.EPOLL_CTL_ADD, pa.FD, &ev))
@@ -212,9 +212,9 @@ func (p *Poller) AddRead(pa *PollAttachment, edgeTriggered bool) error {
 // AddWrite registers the given file descriptor with writable event to the poller.
 func (p *Poller) AddWrite(pa *PollAttachment, edgeTriggered bool) error {
 	var ev epollevent
-	ev.events = WriteEvents
+	ev.events = WriteEvents | unix.EPOLLRDHUP
 	if edgeTriggered {
-		ev.events |= unix.EPOLLET | unix.EPOLLRDHUP
+		ev.events |= unix.EPOLLET
 	}
 	convertPollAttachment(unsafe.Pointer(&ev.data), pa)
 	return os.NewSyscallError("epoll_ctl add", epollCtl(p.fd, unix.EPOLL_CTL_ADD, pa.FD, &ev))
@@ -223,10 +223,30 @@ func (p *Poller) AddWrite(pa *PollAttachment, edgeTriggered bool) error {
 // ModRead modifies the given file descriptor with readable event in the poller.
 func (p *Poller) ModRead(pa *PollAttachment, edgeTriggered bool) error {
 	var ev epollevent
-	ev.events = ReadEvents
+	ev.events = ReadEvents | unix.EPOLLRDHUP
 	if edgeTriggered {
-		ev.events |= unix.EPOLLET | unix.EPOLLRDHUP
+		ev.events |= unix.EPOLLET
 	}
+	convertPollAttachment(unsafe.Pointer(&ev.data), pa)
+	return os.NewSyscallError("epoll_ctl mod", epollCtl(p.fd, unix.EPOLL_CTL_MOD, pa.FD, &ev))
+}
+
+// ModWrite modifies the given file descriptor with writable event in the poller.
+func (p *Poller) ModWrite(pa *PollAttachment, edgeTriggered bool) error {
+	var ev epollevent
+	ev.events = WriteEvents
+	if edgeTriggered {
+		ev.events |= unix.EPOLLET
+	}
+	convertPollAttachment(unsafe.Pointer(&ev.data), pa)
+	return os.NewSyscallError("epoll_ctl mod", epollCtl(p.fd, unix.EPOLL_CTL_MOD, pa.FD, &ev))
+}
+
+// ModReadDisabled disables all explicitly subscribed events. EPOLLERR and
+// EPOLLHUP are still reported unconditionally by epoll, while a peer half-close
+// remains pending until readable events are re-enabled and the socket is drained.
+func (p *Poller) ModReadDisabled(pa *PollAttachment, _ bool) error {
+	var ev epollevent
 	convertPollAttachment(unsafe.Pointer(&ev.data), pa)
 	return os.NewSyscallError("epoll_ctl mod", epollCtl(p.fd, unix.EPOLL_CTL_MOD, pa.FD, &ev))
 }
@@ -234,9 +254,9 @@ func (p *Poller) ModRead(pa *PollAttachment, edgeTriggered bool) error {
 // ModReadWrite modifies the given file descriptor with readable and writable events in the poller.
 func (p *Poller) ModReadWrite(pa *PollAttachment, edgeTriggered bool) error {
 	var ev epollevent
-	ev.events = ReadWriteEvents
+	ev.events = ReadWriteEvents | unix.EPOLLRDHUP
 	if edgeTriggered {
-		ev.events |= unix.EPOLLET | unix.EPOLLRDHUP
+		ev.events |= unix.EPOLLET
 	}
 	convertPollAttachment(unsafe.Pointer(&ev.data), pa)
 	return os.NewSyscallError("epoll_ctl mod", epollCtl(p.fd, unix.EPOLL_CTL_MOD, pa.FD, &ev))

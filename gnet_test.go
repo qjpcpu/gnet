@@ -2185,6 +2185,7 @@ type streamProxyServer struct {
 
 	backendServers []string
 	packetSize     int
+	highWatermark  int
 }
 
 func (p *streamProxyServer) OnShutdown(eng Engine) {
@@ -2195,6 +2196,9 @@ func (p *streamProxyServer) OnShutdown(eng Engine) {
 func (p *streamProxyServer) OnOpen(c Conn) (out []byte, action Action) {
 	if c.LocalAddr().String() == p.ListenerAddr { // it's a server connection
 		out = []byte("andypan\r\n")
+		if p.highWatermark > 0 && runtime.GOOS == "linux" {
+			assert.NoError(p.tester, c.(ReadController).PauseRead(nil), "PauseRead error")
+		}
 		p.backendServerPoolMu.Lock()
 		backendServer := p.backendServerPool[len(p.backendServerPool)-1]
 		p.backendServerPool = p.backendServerPool[:len(p.backendServerPool)-1]
@@ -2244,6 +2248,9 @@ func (p *streamProxyServer) OnOpen(c Conn) (out []byte, action Action) {
 		assert.True(p.tester, ok, "context is not Conn")
 		assert.NotNil(p.tester, serverConn, "context is not Conn")
 		serverConn.SetContext(c)
+		if p.highWatermark > 0 && runtime.GOOS == "linux" {
+			assert.NoError(p.tester, serverConn.(ReadController).ResumeRead(nil), "ResumeRead error")
+		}
 
 		err := c.EventLoop().Execute(NewContext(context.Background(), c.LocalAddr()),
 			RunnableFunc(func(ctx context.Context) error {
@@ -2297,14 +2304,32 @@ func (p *streamProxyServer) OnTraffic(c Conn) Action {
 
 	pc, ok := c.Context().(Conn)
 	if !ok {
-		// The backend connection is not established yet, retry later.
-		assert.NoError(p.tester, c.Wake(nil), "Wake connection error")
+		// The backend connection is not established yet. Stop reading so that
+		// transport-level flow control applies backpressure to the client.
+		if p.highWatermark > 0 && runtime.GOOS == "linux" {
+			assert.NoError(p.tester, c.(ReadController).PauseRead(nil), "PauseRead error")
+		} else {
+			assert.NoError(p.tester, c.Wake(nil), "Wake connection error")
+		}
 		return None
 	}
 
 	_, err := c.WriteTo(pc)
 	assert.NoErrorf(p.tester, err, "%s: Write error from %s to %s",
 		connType, c.LocalAddr().String(), pc.RemoteAddr().String())
+	if p.highWatermark > 0 && runtime.GOOS == "linux" && pc.OutboundBuffered() >= p.highWatermark {
+		assert.NoError(p.tester, c.(ReadController).PauseRead(nil), "PauseRead error")
+	}
+	return None
+}
+
+func (p *streamProxyServer) OnWriteBufferEmpty(c Conn) Action {
+	if p.highWatermark == 0 || runtime.GOOS != "linux" {
+		return None
+	}
+	if peer, ok := c.Context().(Conn); ok {
+		assert.NoError(p.tester, peer.(ReadController).ResumeRead(nil), "ResumeRead error")
+	}
 	return None
 }
 
@@ -2418,6 +2443,10 @@ func testStreamProxyServer(t *testing.T, addr string, backendServers []string, m
 		ListenerAddr:      address,
 		backendServers:    backendServers,
 		backendServerPool: backendServers,
+		// startClient writes a complete 1 MiB request before reading its response,
+		// while the backend echoes as it reads. Keep the watermark above that
+		// protocol-level atomic write to avoid a full-duplex flow-control cycle.
+		highWatermark: 2 * streamLen,
 	}
 
 	var (

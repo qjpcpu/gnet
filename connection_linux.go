@@ -27,6 +27,28 @@ import (
 
 func (c *conn) processIO(_ int, ev netpoll.IOEvent, _ netpoll.IOFlags) error {
 	el := c.loop
+	if c.readPaused.Load() {
+		if ev&unix.EPOLLERR != 0 {
+			c.outboundBuffer.Release()
+			return el.close(c, io.EOF)
+		}
+		if ev&unix.EPOLLHUP != 0 && c.hasPendingInput() {
+			// EPOLLHUP is reported even when it is not part of the interest mask.
+			// Suspend polling until reads resume so that a Unix peer's final bytes
+			// are not discarded when it closes the socket.
+			c.isEOF = true
+			return el.suspendPollInterest(c)
+		}
+		if ev&unix.EPOLLRDHUP != 0 {
+			// A stale half-close notification may have been queued before the
+			// pause took effect. Remember EOF and process only a writable event.
+			c.isEOF = true
+			if ev&netpoll.WriteEvents != 0 {
+				return el.write(c)
+			}
+			return nil
+		}
+	}
 	// First check for any unexpected non-IO events.
 	// For these events we just close the connection directly.
 	if ev&(netpoll.ErrEvents|unix.EPOLLRDHUP) != 0 && ev&netpoll.ReadWriteEvents == 0 {
@@ -67,4 +89,13 @@ func (c *conn) processIO(_ int, ev netpoll.IOEvent, _ netpoll.IOFlags) error {
 		return el.read(c)
 	}
 	return nil
+}
+
+func (c *conn) hasPendingInput() bool {
+	if c.InboundBuffered() > 0 {
+		return true
+	}
+	var buf [1]byte
+	n, _, err := unix.Recvfrom(c.fd, buf[:], unix.MSG_PEEK|unix.MSG_DONTWAIT)
+	return n > 0 && err == nil
 }

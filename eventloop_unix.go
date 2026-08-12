@@ -222,6 +222,7 @@ func (el *eventloop) register0(c *conn) error {
 		c.release()
 		return err
 	}
+	c.pollRegistered = true
 	el.connections.addConn(c, el.idx)
 	if c.isDatagram && c.remote != nil {
 		return nil
@@ -239,8 +240,8 @@ func (el *eventloop) open(c *conn) error {
 		}
 	}
 
-	if !c.outboundBuffer.IsEmpty() && !el.engine.opts.EdgeTriggeredIO {
-		if err := el.poller.ModReadWrite(&c.pollAttachment, false); err != nil {
+	if !c.outboundBuffer.IsEmpty() {
+		if err := el.updatePollInterest(c); err != nil {
 			return err
 		}
 	}
@@ -253,7 +254,7 @@ func (el *eventloop) read0(a any) error {
 }
 
 func (el *eventloop) read(c *conn) error {
-	if !c.opened {
+	if !c.opened || c.readPaused.Load() {
 		return nil
 	}
 
@@ -284,6 +285,9 @@ loop:
 	}
 	_, _ = c.inboundBuffer.Write(c.buffer)
 	c.buffer = c.buffer[:0]
+	if c.readPaused.Load() {
+		return nil
+	}
 
 	if c.isEOF || (isET && recv < chunk) {
 		goto loop
@@ -343,10 +347,14 @@ loop:
 		goto loop
 	}
 
-	// All data have been sent, it's no need to monitor the writable events for LT mode,
-	// remove the writable event from poller to help the future event-loops if necessary.
-	if !isET && c.outboundBuffer.IsEmpty() {
-		return el.poller.ModRead(&c.pollAttachment, false)
+	if c.outboundBuffer.IsEmpty() {
+		if err = el.updatePollInterest(c); err != nil {
+			return err
+		}
+		if handler, ok := el.eventHandler.(WriteBufferEmptyEventHandler); ok {
+			return el.handleAction(c, handler.OnWriteBufferEmpty(c))
+		}
+		return nil
 	}
 
 	// To prevent infinite writing in ET mode and starving other events,
@@ -384,7 +392,12 @@ func (el *eventloop) close(c *conn, err error) error {
 	c.release()
 
 	var errStr strings.Builder
-	err0, err1 := el.poller.Delete(c.fd), unix.Close(c.fd)
+	var err0 error
+	if c.pollRegistered {
+		err0 = el.poller.Delete(c.fd)
+		c.pollRegistered = false
+	}
+	err1 := unix.Close(c.fd)
 	if err0 != nil {
 		err0 = fmt.Errorf("failed to delete fd=%d from poller in event-loop(%d): %v",
 			c.fd, el.idx, os.NewSyscallError("delete", err0))
@@ -411,6 +424,19 @@ func (el *eventloop) wake(c *conn) error {
 	action := el.eventHandler.OnTraffic(c)
 
 	return el.handleAction(c, action)
+}
+
+func (el *eventloop) resumeRead0(a any) error {
+	c := a.(*conn)
+	if !c.opened || c.readPaused.Load() {
+		return nil
+	}
+	if c.InboundBuffered() > 0 {
+		if err := el.wake(c); err != nil || !c.opened || c.readPaused.Load() {
+			return err
+		}
+	}
+	return el.read(c)
 }
 
 func (el *eventloop) ticker(ctx context.Context) {

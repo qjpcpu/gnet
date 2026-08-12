@@ -20,6 +20,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -54,6 +55,9 @@ type conn struct {
 	isDatagram     bool                   // UDP protocol
 	opened         bool                   // connection opened event fired
 	isEOF          bool                   // whether the connection has reached EOF
+	readPaused     atomic.Bool            // whether read events are temporarily disabled
+	readControlMu  sync.Mutex             // serializes desired read state updates and command submission
+	pollRegistered bool                   // event-loop-owned poll registration state
 }
 
 func newStreamConn(proto string, fd int, el *eventloop, sa unix.Sockaddr, localAddr, remoteAddr net.Addr) (c *conn) {
@@ -164,9 +168,7 @@ loop:
 		// writing it back to the remote in the next round for LT mode.
 		if err == unix.EAGAIN {
 			_, err = c.outboundBuffer.Write(data)
-			if !isET {
-				err = c.loop.poller.ModReadWrite(&c.pollAttachment, isET)
-			}
+			err = c.loop.updatePollInterest(c)
 			return
 		}
 		return 0, err
@@ -178,7 +180,7 @@ loop:
 	// Failed to send all data back to the remote, buffer the leftover data for the next round.
 	if len(data) > 0 {
 		_, _ = c.outboundBuffer.Write(data)
-		err = c.loop.poller.ModReadWrite(&c.pollAttachment, isET)
+		err = c.loop.updatePollInterest(c)
 	}
 
 	return
@@ -214,9 +216,7 @@ loop:
 		// writing it back to the remote in the next round for LT mode.
 		if err == unix.EAGAIN {
 			_, err = c.outboundBuffer.Writev(bs)
-			if !isET {
-				err = c.loop.poller.ModReadWrite(&c.pollAttachment, isET)
-			}
+			err = c.loop.updatePollInterest(c)
 			return
 		}
 		return 0, err
@@ -241,7 +241,7 @@ loop:
 	// Failed to send all data back to the remote, buffer the leftover data for the next round.
 	if remaining > 0 {
 		_, _ = c.outboundBuffer.Writev(bs)
-		err = c.loop.poller.ModReadWrite(&c.pollAttachment, isET)
+		err = c.loop.updatePollInterest(c)
 	}
 
 	return
