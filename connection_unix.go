@@ -38,26 +38,31 @@ import (
 )
 
 type conn struct {
-	fd             int                    // file descriptor
-	gfd            gfd.GFD                // gnet file descriptor
-	ctx            any                    // user-defined context
-	safeCtx        atomic.Pointer[any]    // safe user-defined context
-	remote         unix.Sockaddr          // remote socket address
-	proto          string                 // protocol name: "tcp", "udp", or "unix".
-	localAddr      net.Addr               // local addr
-	remoteAddr     net.Addr               // remote addr
-	loop           *eventloop             // connected event-loop
-	outboundBuffer elastic.Buffer         // buffer for data that is eligible to be sent to the remote
-	pollAttachment netpoll.PollAttachment // connection attachment for poller
-	inboundBuffer  elastic.RingBuffer     // buffer for leftover data from the remote
-	buffer         []byte                 // buffer for the latest bytes
-	cache          []byte                 // temporary cache for the inbound data
-	isDatagram     bool                   // UDP protocol
-	opened         bool                   // connection opened event fired
-	isEOF          bool                   // whether the connection has reached EOF
-	readPaused     atomic.Bool            // whether read events are temporarily disabled
-	readControlMu  sync.Mutex             // serializes desired read state updates and command submission
-	pollRegistered bool                   // event-loop-owned poll registration state
+	fd              int                    // file descriptor
+	gfd             gfd.GFD                // gnet file descriptor
+	ctx             any                    // user-defined context
+	safeCtx         atomic.Pointer[any]    // safe user-defined context
+	remote          unix.Sockaddr          // remote socket address
+	proto           string                 // protocol name: "tcp", "udp", or "unix".
+	localAddr       net.Addr               // local addr
+	remoteAddr      net.Addr               // remote addr
+	loop            *eventloop             // connected event-loop
+	outboundBuffer  elastic.Buffer         // buffer for data that is eligible to be sent to the remote
+	pollAttachment  netpoll.PollAttachment // connection attachment for poller
+	inboundBuffer   elastic.RingBuffer     // buffer for leftover data from the remote
+	buffer          []byte                 // buffer for the latest bytes
+	cache           []byte                 // temporary cache for the inbound data
+	isDatagram      bool                   // UDP protocol
+	opened          bool                   // connection opened event fired
+	eofPending      bool                   // whether a peer EOF is pending delivery after all input is drained
+	readTerminalErr error                  // hard read error to report after all preceding input is delivered
+	readEOF         bool                   // whether the peer EOF has been delivered to the event handler
+	writeClosing    bool                   // whether CloseWrite is waiting for buffered output to drain
+	writeClosed     bool                   // whether the local writing half has been shut down
+	writeCloseCBs   []AsyncCallback        // callbacks waiting for the current CloseWrite operation
+	readPaused      atomic.Bool            // whether read events are temporarily disabled
+	readControlMu   sync.Mutex             // serializes desired read state updates and command submission
+	pollRegistered  bool                   // event-loop-owned poll registration state
 }
 
 func newStreamConn(proto string, fd int, el *eventloop, sa unix.Sockaddr, localAddr, remoteAddr net.Addr) (c *conn) {
@@ -95,7 +100,12 @@ func newUDPConn(fd int, el *eventloop, localAddr net.Addr, sa unix.Sockaddr, con
 
 func (c *conn) release() {
 	c.opened = false
-	c.isEOF = false
+	c.eofPending = false
+	c.readTerminalErr = nil
+	c.readEOF = false
+	c.writeClosing = false
+	c.writeClosed = false
+	c.writeCloseCBs = nil
 	c.ctx = nil
 	c.safeCtx.Store(nil)
 	c.buffer = nil
@@ -144,6 +154,9 @@ func (c *conn) open(buf []byte) error {
 }
 
 func (c *conn) write(data []byte) (n int, err error) {
+	if !c.opened || c.readTerminalErr != nil || c.writeClosing || c.writeClosed {
+		return 0, net.ErrClosed
+	}
 	isET := c.loop.engine.opts.EdgeTriggeredIO
 	n = len(data)
 	// If there is pending data in outbound buffer,
@@ -187,6 +200,9 @@ loop:
 }
 
 func (c *conn) writev(bs [][]byte) (n int, err error) {
+	if !c.opened || c.readTerminalErr != nil || c.writeClosing || c.writeClosed {
+		return 0, net.ErrClosed
+	}
 	isET := c.loop.engine.opts.EdgeTriggeredIO
 
 	for _, b := range bs {
@@ -433,6 +449,9 @@ func (c *conn) Writev(bs [][]byte) (int, error) {
 }
 
 func (c *conn) ReadFrom(r io.Reader) (int64, error) {
+	if !c.opened || c.readTerminalErr != nil || c.writeClosing || c.writeClosed {
+		return 0, net.ErrClosed
+	}
 	return c.outboundBuffer.ReadFrom(r)
 }
 

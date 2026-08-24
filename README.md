@@ -75,6 +75,43 @@ go get -u github.com/panjf2000/gnet/v2
 go get -u github.com/panjf2000/gnet
 ```
 
+## Linux stream proxy half-close
+
+TCP EOF closes only the peer's writing half. A bidirectional proxy must therefore propagate EOF in the same direction without closing the reverse data path: EOF from endpoint A calls `CloseWrite` on endpoint B, and EOF from B calls `CloseWrite` on A.
+
+On Linux, implement the optional `EOFEventHandler` and use `WriteHalfCloser`:
+
+```go
+func (p *proxy) OnEOF(src gnet.Conn) gnet.Action {
+	peer, ok := src.Context().(gnet.Conn)
+	if !ok {
+		return gnet.Close
+	}
+	closer, ok := peer.(gnet.WriteHalfCloser)
+	if !ok {
+		_ = peer.Close()
+		return gnet.Close
+	}
+	if err := closer.CloseWrite(func(_ gnet.Conn, err error) error {
+		if err != nil {
+			_ = src.Close()  // SHUT_WR failed: terminate the pair.
+			_ = peer.Close()
+		}
+		return nil
+	}); err != nil {
+		_ = peer.Close()
+		return gnet.Close
+	}
+	return gnet.None
+}
+```
+
+`CloseWrite` waits for gnet's outbound buffer before sending FIN. `PauseRead` also delays EOF until `ResumeRead`; it does not stop the connection's writing half. An `OnWriteBufferEmpty` proxy handler should resume the corresponding source connection as usual.
+
+Do not unconditionally close the peer from `OnClose`: `errors.Is(err, io.EOF)` is normal half-close completion, while resets, application-requested closes (`err == nil`), and other errors should terminate the pair. Forwarding failures and synchronous or asynchronous `CloseWrite` failures must also explicitly close both endpoints. Both proxy connections must belong to the same event-loop when `WriteTo` is used directly.
+
+`SetDeadline` is not available for this purpose. Keep an idle timer in the application's connection-pair state instead. Start it on the first `OnEOF`, reset it on subsequent reverse-direction `OnTraffic`, stop it after both `OnClose` callbacks, and call the concurrency-safe `Close` on both endpoints when it expires. Use a mutex-protected generation counter around `time.AfterFunc` so a stale callback from a stopped/reset timer cannot close a completed pair. A non-positive timeout can disable this policy; choose a value that covers normal backend processing and buffered response delivery.
+
 # 🎡 Use cases
 
 The following corporations/organizations use `gnet` as the underlying network service in production.

@@ -18,7 +18,10 @@
 package gnet
 
 import (
+	"errors"
 	"io"
+	"os"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 
@@ -27,33 +30,55 @@ import (
 
 func (c *conn) processIO(_ int, ev netpoll.IOEvent, _ netpoll.IOFlags) error {
 	el := c.loop
-	if c.readPaused.Load() {
-		if ev&unix.EPOLLERR != 0 {
-			c.outboundBuffer.Release()
-			return el.close(c, io.EOF)
+	if ev&unix.EPOLLERR != 0 && c.readTerminalErr == nil {
+		// SO_ERROR is cleared when queried. Keep it on the connection until every
+		// byte queued before the reset has been delivered through OnTraffic.
+		c.outboundBuffer.Release()
+		c.readTerminalErr = c.pendingSocketError()
+	}
+	if c.readTerminalErr != nil {
+		if c.readEOF {
+			// EOF closes only the peer's writing half. A later hard error still
+			// terminates the whole connection and must fail any pending CloseWrite.
+			// Do not route this through read: it intentionally ignores delivered EOF.
+			return el.close(c, c.readTerminalErr)
 		}
-		if ev&unix.EPOLLHUP != 0 && c.hasPendingInput() {
+		if c.readPaused.Load() {
+			if !c.hasPendingInput() {
+				return el.close(c, c.readTerminalErr)
+			}
+			return el.suspendPollInterest(c)
+		}
+		return el.read(c)
+	}
+	if c.readPaused.Load() {
+		if ev&unix.EPOLLHUP != 0 {
+			if _, halfClose := el.eventHandler.(EOFEventHandler); !halfClose && !c.hasPendingInput() {
+				// Preserve the legacy behavior for handlers that did not opt into
+				// half-close: an input-free full close is observable even while paused.
+				return el.close(c, io.EOF)
+			}
 			// EPOLLHUP is reported even when it is not part of the interest mask.
-			// Suspend polling until reads resume so that a Unix peer's final bytes
-			// are not discarded when it closes the socket.
-			c.isEOF = true
+			// Suspend polling until reads resume so that a peer's final bytes and
+			// EOF are delivered in order without causing a level-triggered busy loop.
+			c.eofPending = true
 			return el.suspendPollInterest(c)
 		}
 		if ev&unix.EPOLLRDHUP != 0 {
 			// A stale half-close notification may have been queued before the
 			// pause took effect. Remember EOF and process only a writable event.
-			c.isEOF = true
+			c.eofPending = true
 			if ev&netpoll.WriteEvents != 0 {
 				return el.write(c)
 			}
 			return nil
 		}
 	}
-	// First check for any unexpected non-IO events.
-	// For these events we just close the connection directly.
-	if ev&(netpoll.ErrEvents|unix.EPOLLRDHUP) != 0 && ev&netpoll.ReadWriteEvents == 0 {
-		c.outboundBuffer.Release() // don't bother to write to a connection that is already broken
-		return el.close(c, io.EOF)
+	// EPOLLHUP is different from EPOLLERR: a Unix peer that calls CloseWrite
+	// followed quickly by Close may report only HUP, so it still goes through the
+	// normal drain-and-EOF path.
+	if !c.readEOF && ev&(unix.EPOLLRDHUP|unix.EPOLLHUP) != 0 {
+		c.eofPending = true
 	}
 	// Secondly, check for EPOLLOUT before EPOLLIN, the former has a higher priority
 	// than the latter regardless of the aliveness of the current connection:
@@ -79,16 +104,24 @@ func (c *conn) processIO(_ int, ev netpoll.IOEvent, _ netpoll.IOFlags) error {
 	}
 	// Ultimately, check for EPOLLRDHUP, this event indicates that the remote has
 	// either closed connection or shut down the writing half of the connection.
-	if ev&unix.EPOLLRDHUP != 0 && c.opened {
-		if ev&unix.EPOLLIN == 0 { // unreadable EPOLLRDHUP, close the connection directly
-			return el.close(c, io.EOF)
-		}
-		// Received the event of EPOLLIN|EPOLLRDHUP, but the previous eventloop.read
-		// failed to drain the socket buffer, so we ensure to get it done this time.
-		c.isEOF = true
+	if c.eofPending && c.opened && !c.readEOF {
+		// RDHUP/HUP can arrive with or without EPOLLIN. Reading explicitly makes LT
+		// and ET modes both continue until zero, after all final bytes have gone
+		// through OnTraffic.
 		return el.read(c)
 	}
 	return nil
+}
+
+func (c *conn) pendingSocketError() error {
+	errno, err := unix.GetsockoptInt(c.fd, unix.SOL_SOCKET, unix.SO_ERROR)
+	if err != nil {
+		return os.NewSyscallError("getsockopt", err)
+	}
+	if errno != 0 {
+		return os.NewSyscallError("socket", syscall.Errno(errno))
+	}
+	return errors.New("gnet: socket error")
 }
 
 func (c *conn) hasPendingInput() bool {

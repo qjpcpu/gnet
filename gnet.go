@@ -486,11 +486,45 @@ type (
 	// transports and platforms return ErrUnsupportedOp.
 	ReadController interface {
 		// PauseRead stops monitoring read events, allowing the transport's native
-		// flow control to apply backpressure to the remote peer.
+		// flow control to apply backpressure to the remote peer. Peer EOF is
+		// remembered but not delivered while reads are paused; the independent
+		// writing half and its buffered output continue to make progress.
 		PauseRead(callback AsyncCallback) error
 
-		// ResumeRead resumes monitoring read events after PauseRead.
+		// ResumeRead resumes monitoring read events after PauseRead. Pending bytes
+		// are delivered through OnTraffic before a pending EOF is delivered through
+		// EOFEventHandler.OnEOF.
 		ResumeRead(callback AsyncCallback) error
+	}
+
+	// WriteHalfCloser is an optional connection capability for gracefully
+	// shutting down the writing half of a stream connection. Applications should
+	// use a type assertion on Conn before use. It is currently supported for TCP
+	// and Unix stream connections on Linux; unsupported transports and platforms
+	// return ErrUnsupportedOp.
+	//
+	// CloseWrite preserves ordering: data accepted before the CloseWrite command
+	// is flushed before the FIN is sent. Writes processed after CloseWrite fail
+	// with net.ErrClosed. The callback runs on the connection's event-loop after
+	// the underlying SHUT_WR completes, or with an error if it cannot complete.
+	WriteHalfCloser interface {
+		CloseWrite(callback AsyncCallback) error
+	}
+
+	// EOFEventHandler is an optional extension to EventHandler for applications
+	// that need TCP-style half-close semantics, such as bidirectional stream
+	// proxies. OnEOF fires exactly once after all bytes preceding the peer's FIN
+	// have been delivered through OnTraffic. The connection remains writable.
+	// Applications usually propagate the EOF to the paired connection by calling
+	// WriteHalfCloser.CloseWrite.
+	//
+	// EOFEventHandler is currently invoked for TCP and Unix stream connections on
+	// Linux. Other platforms retain the historical full-close behavior.
+	//
+	// Event handlers that do not implement EOFEventHandler retain the historical
+	// behavior: a peer EOF closes the entire connection and fires OnClose.
+	EOFEventHandler interface {
+		OnEOF(c Conn) (action Action)
 	}
 
 	// WriteBufferEmptyEventHandler is an optional extension to EventHandler.

@@ -207,7 +207,7 @@ func (p *Poller) AddRead(pa *PollAttachment, edgeTriggered bool) error {
 
 // AddWrite registers the given file descriptor with writable event to the poller.
 func (p *Poller) AddWrite(pa *PollAttachment, edgeTriggered bool) error {
-	var ev uint32 = WriteEvents | unix.EPOLLRDHUP
+	var ev uint32 = WriteEvents
 	if edgeTriggered {
 		ev |= unix.EPOLLET
 	}

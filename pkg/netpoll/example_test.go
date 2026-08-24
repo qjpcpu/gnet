@@ -147,7 +147,7 @@ func Example() {
 		panic(fmt.Sprintf("Error adding file descriptor to poller: %v", err))
 	}
 
-	err = poller.Polling(func(fd int, event netpoll.IOEvent, flags netpoll.IOFlags) error {
+	err = pollForExample(poller, func(fd int, event netpoll.IOEvent, flags netpoll.IOFlags) error {
 		return pa.Callback(fd, event, flags)
 	})
 

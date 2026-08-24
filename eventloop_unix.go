@@ -254,7 +254,10 @@ func (el *eventloop) read0(a any) error {
 }
 
 func (el *eventloop) read(c *conn) error {
-	if !c.opened || c.readPaused.Load() {
+	if !c.opened || c.readEOF {
+		return nil
+	}
+	if c.readPaused.Load() {
 		return nil
 	}
 
@@ -263,14 +266,23 @@ func (el *eventloop) read(c *conn) error {
 	chunk := el.engine.opts.EdgeTriggeredIOChunk
 loop:
 	n, err := unix.Read(c.fd, el.buffer)
-	if err != nil || n == 0 {
+	if err != nil {
 		if err == unix.EAGAIN {
+			if c.readTerminalErr != nil {
+				return el.close(c, c.readTerminalErr)
+			}
 			return nil
 		}
-		if n == 0 {
-			err = io.EOF
+		if c.readTerminalErr != nil {
+			return el.close(c, c.readTerminalErr)
 		}
 		return el.close(c, os.NewSyscallError("read", err))
+	}
+	if n == 0 {
+		if c.readTerminalErr != nil {
+			return el.close(c, c.readTerminalErr)
+		}
+		return el.handleReadEOF(c, os.NewSyscallError("read", io.EOF))
 	}
 	recv += n
 
@@ -286,10 +298,22 @@ loop:
 	_, _ = c.inboundBuffer.Write(c.buffer)
 	c.buffer = c.buffer[:0]
 	if c.readPaused.Load() {
+		if c.readTerminalErr != nil {
+			return el.updatePollInterest(c)
+		}
 		return nil
 	}
 
-	if c.isEOF || (isET && recv < chunk) {
+	if c.readTerminalErr != nil {
+		// A hard error is terminal but bytes preceding it remain valid stream data.
+		// Drain incrementally so PauseRead and the ET fairness budget still apply.
+		if n < len(el.buffer) || (isET && recv < chunk) {
+			goto loop
+		}
+		return el.poller.Trigger(queue.LowPriority, el.read0, c)
+	}
+
+	if c.eofPending || (isET && recv < chunk) {
 		goto loop
 	}
 
@@ -348,13 +372,18 @@ loop:
 	}
 
 	if c.outboundBuffer.IsEmpty() {
+		if err = el.finishCloseWrite(c); err != nil || !c.opened {
+			return err
+		}
 		if err = el.updatePollInterest(c); err != nil {
 			return err
 		}
 		if handler, ok := el.eventHandler.(WriteBufferEmptyEventHandler); ok {
-			return el.handleAction(c, handler.OnWriteBufferEmpty(c))
+			if err = el.handleAction(c, handler.OnWriteBufferEmpty(c)); err != nil || !c.opened {
+				return err
+			}
 		}
-		return nil
+		return el.maybeFinalizeHalfClose(c)
 	}
 
 	// To prevent infinite writing in ET mode and starving other events,
@@ -374,6 +403,7 @@ func (el *eventloop) close(c *conn, err error) error {
 	}
 
 	el.connections.delConn(c)
+	el.failCloseWrite(c, err)
 	action := el.eventHandler.OnClose(c, err)
 
 	// Send residual data in buffer back to the remote before actually closing the connection.
@@ -428,7 +458,7 @@ func (el *eventloop) wake(c *conn) error {
 
 func (el *eventloop) resumeRead0(a any) error {
 	c := a.(*conn)
-	if !c.opened || c.readPaused.Load() {
+	if !c.opened || c.readEOF || c.readPaused.Load() {
 		return nil
 	}
 	if c.InboundBuffered() > 0 {

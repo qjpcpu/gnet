@@ -15,18 +15,20 @@
 package gnet
 
 func (el *eventloop) updatePollInterest(c *conn) error {
-	wantRead := !c.readPaused.Load()
-	wantWrite := !c.outboundBuffer.IsEmpty()
+	wantRead := !c.readEOF && !c.readPaused.Load()
+	wantWrite := c.readTerminalErr == nil && !c.outboundBuffer.IsEmpty()
 	isET := el.engine.opts.EdgeTriggeredIO
 	if !c.pollRegistered {
-		if !wantRead {
-			return nil
-		}
 		var err error
-		if wantWrite {
+		switch {
+		case wantRead && wantWrite:
 			err = el.poller.AddReadWrite(&c.pollAttachment, isET)
-		} else {
+		case wantRead:
 			err = el.poller.AddRead(&c.pollAttachment, isET)
+		case wantWrite:
+			err = el.poller.AddWrite(&c.pollAttachment, isET)
+		default:
+			return nil
 		}
 		if err == nil {
 			c.pollRegistered = true
@@ -42,6 +44,9 @@ func (el *eventloop) updatePollInterest(c *conn) error {
 	case wantWrite:
 		return el.poller.ModWrite(&c.pollAttachment, isET)
 	default:
+		if c.readEOF || c.readTerminalErr != nil {
+			return el.suspendPollInterest(c)
+		}
 		return el.poller.ModReadDisabled(&c.pollAttachment, isET)
 	}
 }

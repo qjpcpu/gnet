@@ -75,6 +75,43 @@ go get -u github.com/panjf2000/gnet/v2
 go get -u github.com/panjf2000/gnet
 ```
 
+## Linux 流式代理半关闭
+
+TCP EOF 只关闭对端的写方向。双向代理必须沿同一方向传播 EOF，同时保留反向数据通道：端点 A 收到 EOF 时对端点 B 调用 `CloseWrite`，端点 B 收到 EOF 时也对端点 A 调用 `CloseWrite`。
+
+在 Linux 上，实现可选的 `EOFEventHandler` 并使用 `WriteHalfCloser`：
+
+```go
+func (p *proxy) OnEOF(src gnet.Conn) gnet.Action {
+	peer, ok := src.Context().(gnet.Conn)
+	if !ok {
+		return gnet.Close
+	}
+	closer, ok := peer.(gnet.WriteHalfCloser)
+	if !ok {
+		_ = peer.Close()
+		return gnet.Close
+	}
+	if err := closer.CloseWrite(func(_ gnet.Conn, err error) error {
+		if err != nil {
+			_ = src.Close() // SHUT_WR 失败，终止整个连接对。
+			_ = peer.Close()
+		}
+		return nil
+	}); err != nil {
+		_ = peer.Close()
+		return gnet.Close
+	}
+	return gnet.None
+}
+```
+
+`CloseWrite` 会等待 gnet 的 outbound buffer 排空后再发送 FIN。`PauseRead` 也会把 EOF 延迟到 `ResumeRead`，但不会阻塞连接自身的写方向；proxy 的 `OnWriteBufferEmpty` 应继续恢复对应源连接的读取。
+
+不要在 `OnClose` 中无条件关闭 peer：`errors.Is(err, io.EOF)` 表示正常的 half-close 收敛；RST、应用主动全关闭（`err == nil`）和其他错误都应终止整个连接对。转发失败以及 `CloseWrite` 的同步或异步失败也必须显式关闭两端。直接使用 `WriteTo` 时，proxy 两端必须属于同一个 event-loop。
+
+当前不能依赖 `SetDeadline` 实现此超时。应用应在连接对状态上维护空闲计时器：首次 `OnEOF` 时启动，half-close 后反方向每次 `OnTraffic` 时重置，两端都 `OnClose` 后停止；到期后调用并发安全的 `Close` 关闭两端。使用 mutex 保护的 generation 配合 `time.AfterFunc`，避免已经 Stop/Reset 的旧回调误关已完成的连接对。非正数可表示禁用超时；具体时长应覆盖正常的后端处理和缓冲响应发送时间。
+
 # 🎡 用户案例
 
 以下公司/组织在生产环境上使用了 `gnet` 作为底层网络服务。

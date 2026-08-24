@@ -40,7 +40,7 @@ func (c *conn) processIO(_ int, filter netpoll.IOEvent, flags netpoll.IOFlags) (
 		case unix.EVFILT_READ:
 			// Received the event of EVFILT_READ|EV_EOF, but the previous eventloop.read
 			// failed to drain the socket buffer, so we make sure we get it done this time.
-			c.isEOF = true
+			c.eofPending = true
 			err = el.read(c)
 		case unix.EVFILT_WRITE:
 			// On macOS, the kqueue in either LT or ET mode will notify with one event for the
